@@ -12,6 +12,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from io import StringIO
 
 import rich_click as click
@@ -167,16 +168,25 @@ def _run_objdump(objdump, library):
     # https://github.com/espressif/esp-idf/issues/7903).
     new_env['LC_ALL'] = 'C'
 
-    output = subprocess.check_output([objdump, '-h', library], env=new_env).decode()
-    if not output.strip():
-        raise LdGenFailure(
-            f"'{objdump} -h {library}' ran successfully but returned no output. The toolchain ran "
-            'but its output was empty when captured by the build system. This is usually caused by '
-            'antivirus, endpoint-security or DLP/encryption software stripping the output of '
-            'toolchain processes; the same command often works when run directly in a terminal. '
-            'Add an exclusion for the ESP-IDF tools directory in that software, then build again.'
-        )
-    return output
+    # Antivirus or security software on Windows can transiently lock or intercept
+    # short-lived child processes during rapid process spawning. Retry with a brief
+    # backoff before giving up.
+    for attempt in range(5):
+        try:
+            output = subprocess.check_output([objdump, '-h', library], env=new_env).decode()
+            if output.strip():
+                return output
+        except subprocess.CalledProcessError:
+            pass
+        time.sleep(0.05 * (attempt + 1))
+
+    raise LdGenFailure(
+        f"'{objdump} -h {library}' ran successfully but returned no output after retries. The toolchain ran "
+        'but its output was empty when captured by the build system. This is usually caused by '
+        'antivirus, endpoint-security or DLP/encryption software stripping the output of '
+        'toolchain processes; the same command often works when run directly in a terminal. '
+        'Add an exclusion for the ESP-IDF tools directory in that software, then build again.'
+    )
 
 
 def _run(
@@ -215,9 +225,11 @@ def _run(
 
     try:
         sections_infos = EntityDB()
+        processed_libraries = set()
         for library in libraries_file:
             library = library.strip()
-            if library:
+            if library and library not in processed_libraries:
+                processed_libraries.add(library)
                 dump = StringIO(_run_objdump(objdump, library))
                 dump.name = library
                 try:
